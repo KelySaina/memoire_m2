@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: microservices-ingress
+  namespace: microservices
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /graphql
+spec:
+  rules:
+    - host: myapp.local
+      http:
+        paths:
+          # --- AUTH SERVICE ---
+          - path: /auth(/|$)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 4001
+
+          # --- ORDER SERVICE ---
+          - path: /orders(/|$)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: order-service
+                port:
+                  number: 4002
+
+          # --- PRODUCT SERVICE ---
+          - path: /products(/|$)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: product-service
+                port:
+                  number: 4003

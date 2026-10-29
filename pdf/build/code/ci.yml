@@ -1,0 +1,307 @@
+name: CI/CD
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: kelysaina
+  NAMESPACE: microservices
+  HEALTH_TIMEOUT: 180 # seconds
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_services: ${{ steps.changes.outputs.CHANGED_SERVICES }}
+      version: ${{ steps.version.outputs.VERSION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate global version
+        id: version
+        run: |
+          VERSION="v-$((RANDOM%9000+1000))"
+          BUILD_DATE=$(date +%F)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated global version: $VERSION, build date: $BUILD_DATE"
+
+      - name: Determine changed services
+        id: changes
+        run: |
+          git fetch --depth=2
+          PREV_COMMIT=${{ github.event.before }}
+          if [ -z "$PREV_COMMIT" ] || [ "$PREV_COMMIT" = "0000000000000000000000000000000000000000" ]; then
+            PREV_COMMIT=$(git rev-parse HEAD~1)
+          fi
+
+          CHANGED_SERVICES=$(git diff --name-only "$PREV_COMMIT" HEAD \
+            | grep -E '^services/' \
+            | cut -d/ -f2 \
+            | sort -u \
+            | tr '\n' ' ')
+          echo "Changed services: $CHANGED_SERVICES"
+          echo "CHANGED_SERVICES=$CHANGED_SERVICES" >> $GITHUB_OUTPUT
+
+      - name: Build and Push changed images
+        run: |
+          if [ -z "${{ steps.changes.outputs.CHANGED_SERVICES }}" ]; then
+            echo "No services changed. Skipping build."
+          else
+            for service in ${{ steps.changes.outputs.CHANGED_SERVICES }}; do
+              echo "Building and pushing $service:$VERSION"
+              docker build \
+                --build-arg VERSION=$VERSION \
+                --build-arg BUILD_DATE=$BUILD_DATE \
+                -t $REGISTRY/$IMAGE_OWNER/$service:$VERSION \
+                -t $REGISTRY/$IMAGE_OWNER/$service:latest \
+                ./services/$service
+
+              docker push $REGISTRY/$IMAGE_OWNER/$service:$VERSION
+              docker push $REGISTRY/$IMAGE_OWNER/$service:latest
+            done
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull built images
+        run: |
+          for service in ${{ needs.build.outputs.changed_services }}; do
+            echo "Pulling image for $service:$VERSION"
+            docker pull $REGISTRY/$IMAGE_OWNER/$service:$VERSION
+          done
+
+      - name: Validate built images
+        run: |
+          for service in ${{ needs.build.outputs.changed_services }}; do
+            echo "🚀 Testing container startup for $service:$VERSION"
+
+            CONTAINER_ID=$(docker run -d $REGISTRY/$IMAGE_OWNER/$service:$VERSION || true)
+
+            if [ -z "$CONTAINER_ID" ]; then
+              echo "❌ Failed to start $service container"
+              exit 1
+            fi
+
+            # Give it a few seconds to spin up
+            sleep 10
+
+            # Check if the container is still running
+            STATUS=$(docker inspect --format '{{.State.Status}}' $CONTAINER_ID)
+            if [ "$STATUS" != "running" ]; then
+              echo "❌ $service container exited immediately with status: $STATUS"
+              docker logs $CONTAINER_ID
+              docker rm -f $CONTAINER_ID
+              exit 1
+            fi
+
+            # Optional: HTTP probe if service exposes a port
+            PORT=$(docker port $CONTAINER_ID | head -n1 | cut -d: -f2)
+            if [ -n "$PORT" ]; then
+              RESPONSE=$(docker exec $CONTAINER_ID curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/graphql" || echo "")
+              if [[ "$RESPONSE" =~ ^2|3$ ]]; then
+                echo "✅ $service responds on port $PORT (HTTP $RESPONSE)"
+              else
+                echo "⚠️ $service did not respond properly on port $PORT"
+              fi
+            fi
+
+            docker logs $CONTAINER_ID
+            docker rm -f $CONTAINER_ID
+            echo "---------------------------------------------"
+          done
+
+  deploy:
+    runs-on: self-hosted
+    needs: [build, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        run: |
+          kubectl version --client
+          kubectl config get-contexts
+
+      - name: Deploy Namespace
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl get namespaces
+
+      - name: Deploy Base Manifests
+        run: |
+          kubectl apply -n $NAMESPACE -f k8s/svcs/
+          kubectl apply -n $NAMESPACE -f k8s/hpas/
+
+      - name: Deploy Changed Services with Version Tag
+        run: |
+          VERSION=${{ needs.build.outputs.version }}
+          for service in ${{ needs.build.outputs.changed_services }}; do
+            echo "🔹 Deploying $service with version $VERSION"
+
+            # Capture current image and revision
+            CURRENT_IMAGE=$(kubectl get deployment $service -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+            CURRENT_REV=$(kubectl rollout history deployment/$service -n $NAMESPACE | grep -E '^[0-9]+' | tail -n 1 | awk '{print $1}')
+            echo "🔹 Current image for $service: ${CURRENT_IMAGE:-<none>}, revision: ${CURRENT_REV:-<none>}"
+
+            # Deploy new image
+            kubectl set image deployment/$service \
+              $service=$REGISTRY/$IMAGE_OWNER/$service:$VERSION \
+              -n $NAMESPACE --record
+
+            # Annotate deployment for traceability
+            kubectl annotate deployment/$service version=$VERSION --overwrite -n $NAMESPACE
+          done
+
+      - name: Wait and Validate Rollout
+        run: |
+          VERSION=${{ needs.build.outputs.version }}
+
+          for service in ${{ needs.build.outputs.changed_services }}; do
+            echo "🚀 Rolling out $service..."
+
+            # --- Step 1: Wait for rollout status ---
+            if ! kubectl rollout status deployment/$service -n $NAMESPACE --timeout=360s; then
+              echo "❌ Rollout failed for $service. Attempting smart rollback..."
+
+              # Get previous non-latest image from rollout history
+              PREV_IMAGE=$(kubectl rollout history deployment/$service -n $NAMESPACE \
+                            | grep -v "latest" \
+                            | grep "$service=" \
+                            | tail -2 | head -1 \
+                            | sed -E "s/.*$service=([^ ]+).*/\1/")
+
+              if [ -n "$PREV_IMAGE" ]; then
+                echo "🔄 Rolling back $service to previous non-latest image: $PREV_IMAGE"
+                kubectl set image deployment/$service $service=$PREV_IMAGE -n $NAMESPACE --record
+                PREV_VERSION=${PREV_IMAGE##*:}
+                kubectl annotate deployment/$service version=$PREV_VERSION --overwrite -n $NAMESPACE
+              else
+                echo "⚠️ No valid previous non-latest image found. Cannot rollback properly!"
+              fi
+              exit 1
+            fi
+
+            # --- Step 2: Double-check pods readiness ---
+            echo "🩺 Verifying pod readiness for $service..."
+            TIMEOUT=60
+            INTERVAL=15
+            ELAPSED=0
+
+            while [ $ELAPSED -lt $TIMEOUT ]; do
+              NOT_READY=$(kubectl get pods -n $NAMESPACE -l app=$service \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                | grep -v "true" || true)
+
+              if [ -z "$NOT_READY" ]; then
+                echo "✅ All pods ready. Rechecking in $INTERVAL seconds..."
+                sleep $INTERVAL
+
+                # Double-check
+                NOT_READY_AGAIN=$(kubectl get pods -n $NAMESPACE -l app=$service \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                  | grep -v "true" || true)
+
+                if [ -z "$NOT_READY_AGAIN" ]; then
+                  echo "✅ Pods still ready. Deployment for $service healthy."
+                  break
+                else
+                  echo "❌ Pods became unready after recheck. Rolling back..."
+                  PREV_IMAGE=$(kubectl rollout history deployment/$service -n $NAMESPACE \
+                                | grep -v "latest" \
+                                | grep "$service=" \
+                                | tail -2 | head -1 \
+                                | sed -E "s/.*$service=([^ ]+).*/\1/")
+                  if [ -n "$PREV_IMAGE" ]; then
+                    kubectl set image deployment/$service $service=$PREV_IMAGE -n $NAMESPACE --record
+                    PREV_VERSION=${PREV_IMAGE##*:}
+                    kubectl annotate deployment/$service version=$PREV_VERSION --overwrite -n $NAMESPACE
+                  fi
+                  exit 1
+                fi
+              else
+                echo "⏳ Pods not ready yet ($ELAPSED/$TIMEOUTs). Waiting $INTERVAL seconds..."
+                sleep $INTERVAL
+                ELAPSED=$((ELAPSED + INTERVAL))
+              fi
+            done
+
+            # --- Step 3: Timeout protection ---
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "⚠️ Timeout waiting for pods. Rolling back..."
+              PREV_IMAGE=$(kubectl rollout history deployment/$service -n $NAMESPACE \
+                            | grep -v "latest" \
+                            | grep "$service=" \
+                            | tail -2 | head -1 \
+                            | sed -E "s/.*$service=([^ ]+).*/\1/")
+              if [ -n "$PREV_IMAGE" ]; then
+                kubectl set image deployment/$service $service=$PREV_IMAGE -n $NAMESPACE --record
+                PREV_VERSION=${PREV_IMAGE##*:}
+                kubectl annotate deployment/$service version=$PREV_VERSION --overwrite -n $NAMESPACE
+              fi
+              exit 1
+            fi
+
+            echo "✅ Rollout successful for $service with all pods healthy."
+          done
+
+  cypress:
+    runs-on: self-hosted
+    needs: deploy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20' # Cypress 15+ needs Node 18+
+
+      - name: Install frontend dependencies
+        run: npm install
+        working-directory: ./frontend
+
+      - name: Start frontend server
+        run: npm run dev &
+        working-directory: ./frontend
+
+      - name: Install Cypress in tests folder
+        run: npm install cypress --save-dev
+        working-directory: ./tests
+
+      - name: Run Cypress tests
+        run: BASE_URL=http://localhost:5173 npx cypress run --config baseUrl=$BASE_URL
+        working-directory: ./tests
+
+      - name: Upload Cypress artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-artifacts
+          path: |
+            ./tests/cypress/screenshots
